@@ -13,7 +13,7 @@ import {
   MacroConstraint,
   SetRecord,
   ExerciseRuntimeState,
-  GLOBAL_CONFIG,
+  DailySession,
 } from './types';
 
 import {
@@ -21,6 +21,9 @@ import {
   computeVelocityLoss,
   NextSetSuggestion,
 } from './engine/calculateNextSet';
+
+import { SemanticFeedbackService } from './SemanticFeedbackService';
+import { LocalDatabaseService } from './LocalDatabaseService';
 
 // ---------------------------------------------------------------------------
 // 公共类型
@@ -50,6 +53,8 @@ export interface SubmitSetResult {
   setRecord: SetRecord;
   /** 下一组建议，供 UI 展示 */
   suggestion: NextSetSuggestion;
+  /** 教练口吻的语义化建议（由 SemanticFeedbackService 生成） */
+  aiReasoning: string;
   /** 当日宏观熔断警告（Red 区时为 true） */
   meltdownWarning: boolean;
 }
@@ -77,9 +82,19 @@ export class WorkoutSessionService {
   /** 自增 set 计数器，用于生成 setId */
   private setCounter = 0;
 
-  constructor(config: UserConfig, macro: MacroConstraint) {
+  private readonly semanticFeedback = new SemanticFeedbackService();
+  private readonly db: LocalDatabaseService;
+  private readonly startedAt: string;
+
+  constructor(
+    config: UserConfig,
+    macro: MacroConstraint,
+    db?: LocalDatabaseService,
+  ) {
     this.config = config;
     this.macro = macro;
+    this.db = db ?? new LocalDatabaseService();
+    this.startedAt = new Date().toISOString();
   }
 
   // ── 核心接口 ──────────────────────────────────────────────────────────────
@@ -129,7 +144,23 @@ export class WorkoutSessionService {
     // 5. 调用核心决策引擎
     const suggestion = calculateNextSet(partialSet, state);
 
-    // 6. 用引擎结果回填，得到完整 SetRecord
+    // 6. 生成语义化教练建议（覆盖引擎的技术性 aiReasoning）
+    const setNumber = (state.completedSets.length ?? 0) + 1;
+    const aiReasoning = this.semanticFeedback.generate({
+      velocityLossPercent: vl,
+      userRPE: input.userRPE,
+      effectiveRPE,
+      trainingGoal: this.config.trainingGoal,
+      actualLoad: input.actualLoad,
+      actualReps: input.actualReps,
+      decisionStrategy: suggestion.decisionStrategy,
+      nextLoad: suggestion.load,
+      nextReps: suggestion.reps,
+      restSec: suggestion.restSec,
+      setNumber,
+    });
+
+    // 7. 回填完整 SetRecord（aiReasoning 使用语义化版本）
     const completedSet: SetRecord = {
       ...partialSet,
       decisionStrategy: suggestion.decisionStrategy,
@@ -137,11 +168,11 @@ export class WorkoutSessionService {
         load: suggestion.load,
         reps: suggestion.reps,
         restSec: suggestion.restSec,
-        aiReasoning: suggestion.aiReasoning,
+        aiReasoning,
       },
     };
 
-    // 7. 刷新运行时状态
+    // 8. 刷新运行时状态
     //    recentVelocityLosses 保留最近 3 组（趋势预警窗口）
     state.recentVelocityLosses = [
       ...state.recentVelocityLosses,
@@ -151,7 +182,8 @@ export class WorkoutSessionService {
 
     return {
       setRecord: completedSet,
-      suggestion,
+      suggestion: { ...suggestion, aiReasoning },
+      aiReasoning,
       meltdownWarning: this.macro.isMeltdown,
     };
   }
@@ -176,6 +208,34 @@ export class WorkoutSessionService {
       macroConstraint: this.macro,
       exercises,
     };
+  }
+
+  // ── 生命周期 ──────────────────────────────────────────────────────────────
+
+  /**
+   * 结束当前训练 Session：构建完整 DailySession 并持久化到本地数据库。
+   * 返回已保存的 DailySession，供调用方展示或进一步处理。
+   */
+  async finishSession(): Promise<DailySession> {
+    const exercises: Record<string, ExerciseRuntimeState> = {};
+    this.exercises.forEach((state, id) => {
+      exercises[id] = state;
+    });
+
+    const session: DailySession = {
+      sessionId: `${this.config.userId}-${this.macro.date}-${Date.now()}`,
+      userId: this.config.userId,
+      date: this.macro.date,
+      trainingGoal: this.config.trainingGoal,
+      macroConstraint: this.macro,
+      exercises,
+      status: 'Completed',
+      startedAt: this.startedAt,
+      endedAt: new Date().toISOString(),
+    };
+
+    await this.db.saveSession(session);
+    return session;
   }
 
   // ── 内部工具 ──────────────────────────────────────────────────────────────

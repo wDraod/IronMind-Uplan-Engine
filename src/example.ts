@@ -1,17 +1,14 @@
 /**
- * IronMind — 使用示例
- *
- * 模拟一名力量目标用户的深蹲训练：
- *   - 今日 HRV 轻微下降（Yellow 区），轻度限制
- *   - 连续三组，演示引擎如何实时调整建议
+ * IronMind — 使用示例（含持久化闭环）
  *
  * 运行方式：npx ts-node src/example.ts
  */
 
-import { WorkoutSessionService } from './WorkoutSessionService';
+import { WorkoutSessionService, SubmitSetResult } from './WorkoutSessionService';
+import { LocalDatabaseService } from './LocalDatabaseService';
 import { UserConfig, MacroConstraint } from './types';
 
-// ── 1. 配置用户 ─────────────────────────────────────────────────────────────
+// ── 1. 用户配置 ──────────────────────────────────────────────────────────────
 
 const userConfig: UserConfig = {
   userId: 'user-001',
@@ -20,83 +17,129 @@ const userConfig: UserConfig = {
   rpeCalibration: {
     isMocked: true,
     profile: 'Mocked_Veteran_LVP',
-    underreportingFactor: 1.15, // 资深用户习惯低报 RPE ~15%
+    underreportingFactor: 1.15,
   },
 };
 
-// ── 2. 晨间约束（来自宏观引擎，这里手动构造模拟数据） ────────────────────────
+// ── 2. 晨间宏观约束 ──────────────────────────────────────────────────────────
 
 const todayMacro: MacroConstraint = {
-  date: '2026-04-07',
-  deltaHRV: -0.08,        // HRV 下降 8%，落入 Yellow 区
+  date: '2026-04-08',
+  deltaHRV: -0.08,
   hrvStatus: 'Yellow',
-  maxRPECap: 8.5,         // 今日 RPE 上限
-  volumeModifier: -1,     // 力量目标下：砍 1 组
-  loadModifier: 0,        // 保重量
+  maxRPECap: 8.5,
+  volumeModifier: -1,
+  loadModifier: 0,
   isMeltdown: false,
 };
 
-// ── 3. 实例化 Session 服务 ──────────────────────────────────────────────────
+// ── 3. 依赖注入：LocalDatabaseService → WorkoutSessionService ────────────────
 
-const session = new WorkoutSessionService(userConfig, todayMacro);
+const db = new LocalDatabaseService();
+const session = new WorkoutSessionService(userConfig, todayMacro, db);
 
-console.log('='.repeat(60));
-console.log(`IronMind Session 开始 | ${userConfig.name} | ${todayMacro.date}`);
-console.log(`训练目标: ${userConfig.trainingGoal} | HRV 状态: ${todayMacro.hrvStatus}`);
-console.log('='.repeat(60));
+// ── 4. 训练主流程 ─────────────────────────────────────────────────────────────
 
-// ── 4. 模拟三组深蹲 ─────────────────────────────────────────────────────────
+async function main() {
+  console.log('═'.repeat(68));
+  console.log(` IronMind | ${userConfig.name} | ${todayMacro.date}`);
+  console.log(` 目标: ${userConfig.trainingGoal}  |  HRV: ${todayMacro.hrvStatus} (-8%)  |  RPE Cap: ${todayMacro.maxRPECap}`);
+  console.log('═'.repeat(68));
 
-// 第 1 组：热身结束，状态良好
-console.log('\n▶ 第 1 组');
-const result1 = session.submitSet('squat', {
-  targetLoad: 100,
-  targetReps: 5,
-  actualLoad: 100,
-  actualReps: 5,
-  userRPE: 6.5,                // 用户感觉良好
-  firstRepDurationSec: 2.0,
-  lastRepDurationSec: 2.1,     // VL = 5%，状态极佳
-});
-printResult(result1.setRecord.setId, result1.suggestion);
+  // SET 1 — 场景 D：状态极佳
+  console.log('\n◆ SET 1 — 状态探测组');
+  const r1 = session.submitSet('squat', {
+    targetLoad: 100, targetReps: 5,
+    actualLoad: 100, actualReps: 5,
+    userRPE: 6.0,
+    firstRepDurationSec: 2.0,
+    lastRepDurationSec: 2.1,     // VL = 5%
+  });
+  printResult(r1);
 
-// 第 2 组：感觉开始吃力，VL 上升
-console.log('\n▶ 第 2 组');
-const result2 = session.submitSet('squat', {
-  actualLoad: result1.suggestion.load,   // 使用上一组建议的重量
-  actualReps: result1.suggestion.reps,
-  userRPE: 7.0,
-  firstRepDurationSec: 2.0,
-  lastRepDurationSec: 2.24,    // VL = 12%，进入疲劳区间
-});
-printResult(result2.setRecord.setId, result2.suggestion);
+  // SET 2 — 场景 B：心理疲劳 vs 神经质量
+  console.log('\n◆ SET 2 — 心理疲劳 vs 神经质量');
+  const r2 = session.submitSet('squat', {
+    actualLoad: r1.suggestion.load,
+    actualReps: r1.suggestion.reps,
+    userRPE: 8.0,
+    firstRepDurationSec: 2.0,
+    lastRepDurationSec: 2.24,    // VL = 12%
+  });
+  printResult(r2);
 
-// 第 3 组：用户低报 RPE（填 6.5），但测得 VL 骤升至 38% → 触发硬熔断
-console.log('\n▶ 第 3 组（虚报 RPE 边缘 Case）');
-const result3 = session.submitSet('squat', {
-  actualLoad: result2.suggestion.load,
-  actualReps: result2.suggestion.reps,
-  userRPE: 6.5,                // ⚠️ 用户虚报 RPE，实际已力竭
-  firstRepDurationSec: 2.0,
-  lastRepDurationSec: 2.76,    // VL = 38% >> Strength 阈值 20%
-});
-printResult(result3.setRecord.setId, result3.suggestion);
+  // SET 3 — 场景 A：真实力竭
+  console.log('\n◆ SET 3 — 真实力竭');
+  const r3 = session.submitSet('squat', {
+    actualLoad: r2.suggestion.load,
+    actualReps: r2.suggestion.reps,
+    userRPE: 9.0,
+    firstRepDurationSec: 2.0,
+    lastRepDurationSec: 2.36,    // VL = 18%
+  });
+  printResult(r3);
 
-// ── 5. Session 快照（供前端持久化或同步） ────────────────────────────────────
+  // SET 4 — 硬熔断
+  console.log('\n◆ SET 4 — 虚报 RPE / 硬熔断触发');
+  const r4 = session.submitSet('squat', {
+    actualLoad: r3.suggestion.load,
+    actualReps: r3.suggestion.reps,
+    userRPE: 6.5,
+    firstRepDurationSec: 2.0,
+    lastRepDurationSec: 2.76,    // VL = 38%
+  });
+  printResult(r4);
 
-console.log('\n' + '='.repeat(60));
-console.log('Session 快照（exercises）:');
-const snapshot = session.getSessionSnapshot();
-const squatState = snapshot.exercises['squat'];
-console.log(`  深蹲完成组数: ${squatState.completedSets.length}`);
-console.log(`  最近 VL 趋势: [${squatState.recentVelocityLosses.map(v => (v * 100).toFixed(1) + '%').join(', ')}]`);
-console.log('='.repeat(60));
+  // ── 5. 结束 Session，持久化 ─────────────────────────────────────────────────
+
+  console.log('\n' + '─'.repeat(68));
+  console.log(' 正在保存训练数据...');
+
+  const savedSession = await session.finishSession();
+
+  const totalCount = await db.getTotalCount();
+  const history    = await db.getUserHistory(userConfig.userId);
+
+  console.log(` ✓ 数据已成功保存至 data/mock_db.json`);
+  console.log(` ✓ SessionId  : ${savedSession.sessionId}`);
+  console.log(` ✓ 完成组数   : ${Object.values(savedSession.exercises).reduce((n, e) => n + e.completedSets.length, 0)} 组`);
+  console.log(` ✓ 数据库共计 : ${totalCount} 条 Session 记录`);
+  console.log(` ✓ ${userConfig.name} 累计训练日 : ${history.length} 天`);
+  console.log('═'.repeat(68));
+}
 
 // ── 辅助打印 ─────────────────────────────────────────────────────────────────
 
-function printResult(setId: string, suggestion: ReturnType<typeof session.submitSet>['suggestion']) {
-  console.log(`  setId      : ${setId}`);
-  console.log(`  策略       : ${suggestion.decisionStrategy}`);
-  console.log(`  下一组建议 : ${suggestion.load} kg × ${suggestion.reps} 次，休息 ${suggestion.restSec}s`);
-  console.log(`  推理       : ${suggestion.aiReasoning}`);
+function printResult(r: SubmitSetResult) {
+  const { setRecord, suggestion, aiReasoning } = r;
+  const vlPct = `${(setRecord.velocityLossPercent * 100).toFixed(0)}%`;
+  console.log(`  ┌─ ${setRecord.setId}`);
+  console.log(`  │  effectiveRPE: ${setRecord.effectiveRPE.toFixed(1)}  |  VL: ${vlPct}  |  策略: ${suggestion.decisionStrategy}`);
+  console.log(`  │  下一组建议  : ${suggestion.load} kg × ${suggestion.reps} 次，休息 ${suggestion.restSec}s`);
+  console.log(`  └─ 🤖 AI 教练：`);
+  wrapText(aiReasoning, 60).forEach(line => console.log(`       ${line}`));
 }
+
+function wrapText(text: string, maxLen: number): string[] {
+  const result: string[] = [];
+  let remaining = text;
+  while (remaining.length > maxLen) {
+    let cutAt = maxLen;
+    for (let i = maxLen; i > maxLen - 15; i--) {
+      const ch = remaining[i];
+      if (ch === '。' || ch === '，' || ch === ' ' || ch === '；') {
+        cutAt = i + 1;
+        break;
+      }
+    }
+    result.push(remaining.slice(0, cutAt));
+    remaining = remaining.slice(cutAt);
+  }
+  if (remaining.length > 0) result.push(remaining);
+  return result;
+}
+
+main().catch(err => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
